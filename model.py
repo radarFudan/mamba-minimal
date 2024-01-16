@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from einops import rearrange, repeat, einsum
 
+from associative_scan import associative_scan, nested_func
+
 
 @dataclass
 class ModelArgs:
@@ -217,6 +219,7 @@ class MambaBlock(nn.Module):
             mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
             
         """
+        assert len(x.shape) == 3, f"Expected x to have shape (b, l, d), but got shape {x.shape}"
         (b, l, d) = x.shape
         
         x_and_res = self.in_proj(x)  # shape (b, l, 2 * d_in)
@@ -310,17 +313,34 @@ class MambaBlock(nn.Module):
         deltaB_u = einsum(delta, B, u, 'b l d_in, b l n, b l d_in -> b l d_in n')
         
         # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
-        x = torch.zeros((b, d_in, n), device=deltaA.device)
-        ys = []    
-        for i in range(l):
-            x = deltaA[:, i] * x + deltaB_u[:, i]
-            y = einsum(x, C[:, i, :], 'b d_in n, b n -> b d_in')
-            ys.append(y)
-        y = torch.stack(ys, dim=1)  # shape (b, l, d_in)
+        # x = torch.zeros((b, d_in, n), device=deltaA.device)
+        # ys = []    
+        # for i in range(l):
+        #     x = deltaA[:, i] * x + deltaB_u[:, i]
+        #     y = einsum(x, C[:, i, :], 'b d_in n, b n -> b d_in')
+        #     ys.append(y)
+        # y = torch.stack(ys, dim=1)  # shape (b, l, d_in)
         
+        _, hs = associative_scan(binary_operator, (deltaA, deltaB_u), axis=1)
+        # print("hs shape: ", hs.shape)
+        # h = torch.stack(hs, dim=0)  # shape (b, l, d_in, n)
+        y = torch.einsum('b l d n, b l n -> b l d', hs, C)
+
         y = y + u * D
     
         return y
+
+def binary_operator(q_i, q_j):
+    """ Binary operator for parallel scan of linear recurrence. Assumes a diagonal matrix A.
+        Args:
+            q_i: tuple containing A_i and Bu_i at position i       (D,N), (D,N)
+            q_j: tuple containing A_j and Bu_j at position j       (D,N), (D,N)
+        Returns:
+            new element ( A_out, Bu_out )
+    """
+    A_i, b_i = q_i
+    A_j, b_j = q_j
+    return A_j * A_i, A_j * b_i + b_j
 
 
 class RMSNorm(nn.Module):
